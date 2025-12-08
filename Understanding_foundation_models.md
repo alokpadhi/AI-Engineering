@@ -2441,5 +2441,526 @@ Example from practice:
 >
 > In some studies, using verifiers and test-time selection gave performance improvements comparable to increasing model size by a factor of 30, which is much cheaper than training a much larger model. The trade-off is increased inference cost and latency, so in production we usually use a small N and smart selection criteria rather than hundreds of samples per query.”
 
+# Structured Outputs in LLMs
+
+## 1. Why Structured Outputs Matter
+
+Structured outputs are crucial in production for two main scenarios:
+
+1. **Tasks that inherently require structure (semantic parsing)**
+   - Convert natural language → **machine-readable representations**.
+   - Examples:
+     - **Text-to-SQL**:
+       - `"What’s the average monthly revenue over the last 6 months?"`
+       - → Valid PostgreSQL query.
+     - **Text-to-regex**:
+       - System: “Return only the regex.”
+       - Input: `Email address ->`
+       - Model:  
+         ```regex
+         [a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}
+         ```
+   - Classification tasks also fall here when outputs **must** be one of a fixed set of labels.
+
+2. **Tasks where outputs are consumed by downstream systems**
+   - The user-facing task may be “free text”, but downstream components need **parseable structure**.
+   - Example:
+     - Email generation:
+       ```json
+       {
+         "title": "...",
+         "body": "..."
+       }
+       ```
+   - Critical in **agentic workflows**:
+     - Model output → tool input → API call / DB query / action.
+     - If format breaks, the whole pipeline breaks.
+
+> ✅ **Key Insight:**  
+> In production, structured outputs are not a “nice to have”; they’re often a **hard requirement** for reliability.
+
+---
+
+## 2. Existing Frameworks & Provider Features
+
+- Popular libraries / frameworks for structured outputs:
+  - `guidance`, `outlines`, `instructor`, `llama.cpp`, etc.
+- Provider-level features:
+  - **JSON mode** (e.g., OpenAI):
+    - Helps ensure outputs are **syntactically valid JSON**.
+    - But:
+      - Only guarantees JSON validity, **not content correctness**.
+      - JSON can still be **truncated** (e.g., max token limit hit) → invalid / unparseable.
+
+> ⚠️ You must still handle:
+> - Truncation
+> - Missing fields
+> - Semantically incorrect content
+
+---
+
+## 3. Where You Can Enforce Structure in the Stack
+
+You can guide structured outputs at multiple levels:
+
+1. **Prompting**
+2. **Post-processing**
+3. **Test-time compute** (e.g., keep generating until something parses)
+4. **Constrained sampling**
+5. **Finetuning**
+
+The chapter focuses mainly on **prompting, post-processing, constrained sampling, and finetuning**:
+
+- Prompting / post-processing / test-time compute → “bandages”
+  - Work well if the model is already *reasonably good* at structure.
+- Constrained sampling / finetuning → “intensive treatment”
+  - For high-stakes, format-critical use cases.
+
+---
+
+## 4. Prompting for Structured Outputs
+
+- First line of defense: **just ask clearly**.
+  - “Return valid JSON with keys: `title`, `body`, `tags`.”
+  - “Respond with only one of: `yes`, `no`, or `maybe`.”
+- Success depends on:
+  - Model’s **instruction-following ability**
+  - Prompt **clarity & specificity**
+
+### Validation with AI-as-a-Judge
+
+- Pattern:
+  1. First call: generate output.
+  2. Second call: ask another (or same) model to **validate / correct** it.
+- Can significantly increase percentage of **valid outputs**.
+- But:
+  - At least **2× cost** and **higher latency** per request.
+  - Too expensive for high-throughput / low-latency workloads.
+
+> ✅ Good when:
+> - You care a lot about correctness/format.
+> - You can afford extra calls.
+
+---
+
+## 5. Post-Processing
+
+- Cheap & pragmatic: **fix common, repeatable mistakes** with scripts.
+- Observation:
+  - Models make **similar** format mistakes repeatedly.
+  - Example fixes:
+    - If JSON is missing a closing `}` → add it.
+    - If quotes are unbalanced → auto-correct.
+- Real-world example:
+  - LinkedIn’s **defensive YAML parser**:
+    - Boosted valid YAML outputs from **90% → 99.99%**.
+  - They chose YAML over JSON:
+    - Less verbose → fewer output tokens → cheaper.
+
+### When Post-Processing Works
+
+- When outputs are **mostly correct**, with small, systematic glitches:
+  - Occasional punctuation / bracket issues.
+  - Minor syntax problems.
+
+> ⚠️ It **doesn’t** save you if:
+> - Model frequently returns **completely wrong structure**.
+> - Fields missing, wrong nesting, wrong types, etc.
+
+---
+
+## 6. Constrained Sampling
+
+### 6.1 Idea
+
+- Modify the **sampling process** itself so the model can **only produce valid tokens** according to a grammar.
+- Process:
+  1. Model outputs logits over all tokens.
+  2. You **filter** logits to keep only tokens that keep the output **valid under some grammar**.
+  3. Sample from this filtered set.
+
+Illustration:
+
+- For constrained JSON:
+  - After `{`, you shouldn’t get another `{` unless inside a string.
+  - Grammar defines:
+    - What tokens are allowed at each position.
+- Tools enforce: **“only sample tokens that keep us inside the grammar.”**
+
+### 6.2 Pros & Cons
+
+**Pros:**
+- Strong guarantees:
+  - If your grammar is correct, outputs are **always syntactically valid** (e.g., valid JSON, regex, CSV).
+- Great for:
+  - APIs
+  - Tool calls
+  - SQL generation
+  - Regex / config / DSLs
+
+**Cons:**
+- Need a **formal grammar** for each target format:
+  - JSON, YAML, regex, CSV, custom DSLs, etc.
+- Implementation is **non-trivial**:
+  - Grammar engine merging with sampling loop.
+- Increases **latency**:
+  - Extra checks per token (grammar validation/filtering).
+- Limited **generality**:
+  - Only works for formats you’ve explicitly modeled.
+
+Some people argue:
+- Instead of building complex constrained decoding, that effort might be better invested in:
+  - Training/fine-tuning models to be **better at following instructions**.
+
+---
+
+## 7. Finetuning for Structured Outputs
+
+### 7.1 General Finetuning
+
+- Train (or finetune) the model on **many examples** that:
+  - Follow the desired **format**.
+  - Cover the **distribution of tasks** you care about.
+- This is the **most general and powerful** approach:
+  - Works with **any format**:
+    - JSON, YAML, XML, SQL, regex, domain-specific DSLs, etc.
+- While not 100% guaranteed, finetuned models are **far more reliable** than:
+  - Prompt-only approaches.
+
+### 7.2 Architecture Modifications for Strong Guarantees
+
+For some tasks, you can **change the model architecture** to enforce the output space:
+
+- Example: **classification**
+  - Add a **classifier head** on top of the base model.
+  - Output is restricted to one of `N` classes.
+  - Architecture:
+    - Base model → pooled representation → linear layer → softmax over classes.
+- This is called **feature-based transfer**:
+  - Use foundation model as a **feature extractor**.
+  - Train a small head on top for your specific task.
+
+Training options:
+
+- **End-to-end finetuning**:
+  - Update both base model + head.
+  - Better performance, more compute.
+- **Head-only training**:
+  - Freeze base model, train only classifier head.
+  - Cheaper, often good enough.
+
+> ✅ For structured classification-like tasks, a head on top of a frozen encoder is often **simple and robust**.
+
+---
+
+## 8. Future Outlook
+
+- These techniques (prompting, post-processing, constrained sampling, finetuning) exist because:
+  - We assume the model **cannot reliably output structure on its own**.
+- As models become:
+  - Better at **instruction following**
+  - Better at **tool calling & schema adherence**
+- We may:
+  - Rely more on **simple prompts + light validation**.
+  - Use constrained decoding less in everyday workflows.
+- But for **mission-critical systems**, some level of structure enforcement will likely remain.
+
+---
+
+## 🔑 Key Takeaways (Quick Revision)
+
+- Structured outputs matter for:
+  - **Semantic parsing** (text-to-SQL/regex/DSL).
+  - **Integration with downstream tools / agents**.
+- Techniques:
+  - **Prompting**: easiest, but not 100% reliable.
+  - **AI validation (“AI as judge”)**: better quality, higher cost.
+  - **Post-processing**: fix common, small mistakes with code.
+  - **Constrained sampling**: grammar-based filtering at token level; strong guarantees, higher complexity/latency.
+  - **Finetuning**: most general & powerful; can be combined with classifier heads for hard constraints.
+
+---
+
+## 💡 How to Explain in an Interview
+
+> “In production we often need structured outputs—JSON, SQL queries, regexes, or domain-specific formats—because these feed directly into downstream tools and agents. We usually start with clear prompting, but for stricter guarantees we layer techniques.  
+> 
+> When the model mostly gets the format right, we can use simple post-processing or an AI-as-judge step to validate and correct outputs, at the cost of extra latency. For stronger guarantees, we can use **constrained sampling**, where we filter logits using a grammar so the model can only produce valid tokens, or we **finetune** the model on many examples in the target format. For classification-style tasks, we can even add a classifier head on top of the base model to enforce that outputs are one of a fixed label set.  
+> 
+> In practice, the right choice depends on how strict the format requirements are, how much latency and cost we can tolerate, and how often the model’s raw outputs are already well-structured.”
+# The Probabilistic Nature of AI: Inconsistency & Hallucination
+
+## 1. What “Probabilistic” Actually Means
+
+- AI models don’t have fixed answers; they **sample** from probability distributions.
+- Example:
+  - Model estimates:
+    - “Vietnamese cuisine is best” → 70%
+    - “Italian cuisine is best” → 30%
+  - Ask the same question multiple times:
+    - ~70% of the time → Vietnamese
+    - ~30% of the time → Italian
+- Contrast with humans:
+  - A friend will likely give the **same answer** every time (more deterministic).
+- Opposite of probabilistic → **deterministic** (no randomness in outcome).
+
+> ✅ Anything with **non-zero probability** can be generated, however odd or wrong.
+
+---
+
+## 2. Why This Matters: Inconsistency & Hallucinations
+
+The probabilistic nature of LLMs leads to two visible problems:
+
+1. **Inconsistency**
+2. **Hallucination**
+
+Both are major blockers in real-world, especially **enterprise** AI systems.
+
+---
+
+## 3. Inconsistency
+
+### 3.1 Two Types of Inconsistency
+
+1. **Same input → different outputs**
+   - Run same prompt twice → different responses.
+   - Example from the text:
+     - Same essay scored **3/5** in one run and **5/5** in another.
+
+2. **Slightly different input → drastically different outputs**
+   - Tiny changes (e.g., capitalization) → very different responses.
+   - Jarring for users; feels unreliable.
+
+> 🧠 Humans expect *some* stability in behavior. Constantly changing answers undermines trust.
+
+---
+
+### 3.2 Mitigation Strategies for Inconsistency
+
+For **same input → different outputs**, you can:
+
+- **Cache answers**
+  - First response for a query is saved; subsequent identical queries reuse it.
+- Fix **sampling settings**:
+  - Temperature
+  - Top-k
+  - Top-p
+  - (Try to eliminate randomness in decoding.)
+- Fix **random seed**:
+  - Seed = initial state of random number generator.
+  - With same model + same seed + same settings + same hardware → more repeatability.
+
+But even then, **no 100% guarantee**:
+
+- Hardware differences (GPUs, CPU types, numerical libraries) can cause tiny variations.
+- With API providers (OpenAI, Google, etc.), you **don’t control** the hardware.
+
+> Analogy from the text:  
+> A teacher who is only consistent if they sit in **one specific room** – not inspiring trust.
+
+For **slightly different input → very different outputs**:
+
+- Fixing sampling variables is still good practice, but **does not force** similar outputs.
+- Helps:
+  - **Careful prompt design** (Chapter 5).
+  - **Memory systems** to maintain consistent persona/preferences over time (Chapter 6).
+
+---
+
+## 4. Hallucination
+
+### 4.1 What Is Hallucination?
+
+- Hallucination = model generates content **not grounded in reality**.
+- Example:
+  - Some random blog claims: “All US presidents are aliens.”
+  - If such text is in training data, the model may sometimes say:
+    - “The current US president is an alien.”
+  - From a normal person’s POV → the model is “making it up.”
+
+Hallucinations are **fatal** for:
+
+- Medical explanations (e.g., pros/cons of vaccines)
+- Legal reasoning
+- Factual reports, scientific claims, etc.
+
+Real-world failure:
+
+- June 2023: law firm fined for submitting **fictitious case citations** generated by ChatGPT.
+
+> 🔥 Hallucination existed before LLM hype – it has been a known problem in NLG since at least 2016.
+
+---
+
+## 5. Why Do Hallucinations Happen? Two Main Hypotheses
+
+### 5.1 Hypothesis 1 – Self-Delusion / Snowballing
+
+Origin: Ortega et al. (DeepMind, 2021), and later work (e.g., Zhang et al., 2023).
+
+**Core idea:**
+- The model **doesn’t distinguish** between:
+  - User-provided input (real observations)
+  - Its own generated text (actions)
+- Once it generates a wrong statement, it **treats it as if it were true** and builds on it.
+
+Example:
+
+- Prompt: “Who’s Chip Huyen?”
+- Model (wrongly): “Chip Huyen is an architect.”
+- Next tokens are conditioned on:
+  - `"Who’s Chip Huyen? Chip Huyen is an architect."`
+- The model treats “is an architect” like a **fact**, and continues to elaborate on it.
+
+Visual example from the text:
+
+- LLaVA-v1.5-7B:
+  - Image: bottle of shampoo.
+  - Model convinces itself it’s **milk**, then:
+    - Includes “milk” as ingredient from “the label” → purely made up.
+
+This is called:
+
+- **Self-delusion** (Ortega et al.)
+- **Snowballing hallucinations** (Zhang et al.) – one wrong assumption cascades into more errors.
+
+Findings:
+
+- An initial wrong assumption can cause the model to fail on questions it **would otherwise answer correctly**.
+
+Mitigation ideas from DeepMind:
+
+1. Reinforcement Learning perspective:
+   - Teach model to **distinguish**:
+     - Observations (user input)
+     - Actions (model output)
+   - So it doesn’t treat its own generations as facts.
+2. Supervised learning:
+   - Include **factual vs counterfactual signals** in training data:
+     - Mark what’s true vs what’s not.
+
+---
+
+### 5.2 Hypothesis 2 – Mismatch Between Model’s Knowledge & Labeler’s Knowledge
+
+Origin: Leo Gao (OpenAI), echoed by John Schulman (OpenAI co-founder).
+
+**Core idea:**
+
+- During SFT, the model is trained to mimic **labeler responses**.
+- Labelers use **their own knowledge**, which the model **may not have**.
+- The model is essentially learning to **pretend it knows**, because it’s being trained on:
+  > “Answers that use information I don’t necessarily have.”
+
+Thus:
+
+- We’re unintentionally **teaching the model to hallucinate**:
+  - It learns a pattern: when asked X, respond with Y, even if it can’t derive Y from its internal knowledge.
+
+Schulman’s view (assuming “model knows what it knows”):
+
+- If models can estimate their own **epistemic confidence**, we can:
+  - Force them to answer **only when they truly “know”**.
+  - Otherwise say: “Sorry, I don’t know.”
+
+His proposed directions:
+
+1. **Verification**:
+   - For each response:
+     - Ask the model to retrieve or prove the **sources** it’s using.
+   - Use this to:
+     - Filter out answers not grounded in internal or external knowledge.
+
+2. **Better reward functions**:
+   - In RLHF, reward model currently uses **comparisons** (A better than B).
+   - Design reward signals that:
+     - **Punish making things up** more strongly.
+     - Reward answers grounded in **evidence**.
+
+---
+
+## 6. Does RLHF Help or Hurt Hallucinations?
+
+- Schulman (2023 talk): says **RLHF helps reduce hallucinations**.
+- But InstructGPT paper (Ouyang et al., 2022) found:
+
+  - RLHF **worsened hallucinations** compared to SFT-only.
+  - Graph showed RLHF+SFT model (InstructGPT) hallucinating **more** than SFT baseline.
+  - Yet:
+    - Human labelers **still preferred** RLHF model overall.
+    - It was better in other dimensions (helpfulness, style, etc.).
+
+> ✅ Takeaway:  
+> RLHF can **improve user preference** while **not necessarily reducing** (and sometimes increasing) hallucinations.
+
+---
+
+## 7. Practical Mitigations (Without Solving the Theory)
+
+Even if we don’t fully solve hallucinations, we can **reduce** them:
+
+- **Prompting tricks**:
+  - Add instructions like:
+    > “Answer as truthfully as possible. If you don’t know, say ‘Sorry, I don’t know.’”
+  - Encourage **honest uncertainty** instead of confident guesses.
+- **Ask for concise answers**:
+  - Fewer tokens → fewer chances to hallucinate.
+- **Better context construction**:
+  - Retrieval-augmented generation (RAG), good grounding context (Chapters 5 & 6).
+- **Verification / checking**:
+  - Use models (or tools) to:
+    - Check claims against docs, APIs, or search.
+    - Flag suspicious or unsupported responses.
+- **External tools & constraints**:
+  - For factual tasks, rely more on:
+    - Databases
+    - Search
+    - Tools
+  - Use LLM primarily as a **reasoning / interface layer**, not sole fact source.
+
+---
+
+## 8. Detection Is Hard
+
+- If we can’t fully prevent hallucinations, we’d like to **detect** them.
+- But detecting hallucinations is like detecting:
+  - Whether a human is **lying or mistaken**.
+- Not trivial:
+  - Requires **ground truth access** or strong verification methods.
+  - Hence the importance of eval methods (Chapter 4).
+
+---
+
+## 🔑 Key Takeaways (Quick Revision)
+
+- LLMs are **inherently probabilistic** → same input can yield different outputs.
+- This leads to:
+  - **Inconsistency** (variation across runs/inputs).
+  - **Hallucinations** (confidently wrong, ungrounded responses).
+- **Inconsistency**:
+  - Mitigate via:
+    - Caching
+    - Fixed sampling params
+    - Fixed seeds
+    - Better prompts & memory
+- **Hallucinations**:
+  - Two main hypotheses:
+    1. **Self-delusion**: model treats its own outputs as facts and snowballs errors.
+    2. **Knowledge mismatch**: model is trained to mimic labelers who know more than it does.
+  - RLHF can help user preference but may **not always reduce hallucination**.
+- Practical mitigations:
+  - Grounding (RAG), better prompts, concise outputs, verification, reward design.
+
+---
+
+## 💡 How to Explain in an Interview
+
+> “Modern LLMs are probabilistic systems, not deterministic programs. At each step, they sample from a distribution over tokens, so the same prompt can produce different answers. That’s powerful for creativity, but it also leads to inconsistency and hallucinations.  
+> 
+> Inconsistency comes mainly from sampling randomness and sensitivity to small input changes, and we can dampen it via caching, fixing sampling parameters, and good prompt/memory design. Hallucinations are deeper: the model can confidently generate content that isn’t grounded in reality.  
+> 
+> There are two main views on why: one is **self-delusion**—the model treats its own generated tokens like facts and builds on them. The other is a **knowledge mismatch**—during supervised finetuning, we ask it to mimic answers that rely on knowledge it doesn’t truly have, effectively training it to ‘make things up.’ RLHF improves how aligned and pleasant the model feels, but doesn’t always reduce hallucinations. In practice, we mitigate hallucinations by grounding models with external knowledge, adding instructions like ‘if you don’t know, say you don’t know,’ keeping answers concise, and using verification or reward models to penalize unsupported claims.”
+
 
 
