@@ -2197,7 +2197,7 @@ Once you have multiple candidates, you need a **selection strategy**.
 - Probability of a full sequence:
   ```math
   p(x₁, x₂, x₃, …) = p(x₁) × p(x₂ | x₁) × p(x₃ | x₁, x₂) × …
-````
+```
 
 * In log space:
 
