@@ -713,7 +713,7 @@ A retriever is good **only if it improves final answers**.
 > based retrieval enables semantic understanding at higher cost and complexity; most
 > real-world RAG systems balance the two using hybrid retrieval and evaluate retrieval
 > quality both independently and end-to-end.
-```
+``
 # Combining Retrieval Algorithms (Hybrid Search)
 
 ## Core Idea
