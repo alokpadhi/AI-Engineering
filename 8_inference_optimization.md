@@ -109,7 +109,6 @@ Unless you actively train or finetune models, **inference is the phase you’ll 
 of your time and money on**.
 
 ---
-``
 # Inference Overview
 
 In production, the component that runs model inference is called an **inference
